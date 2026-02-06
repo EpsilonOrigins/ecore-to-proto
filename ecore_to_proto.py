@@ -38,6 +38,11 @@ NS = {
 # ─── Data Model ──────────────────────────────────────────────────────────────
 
 @dataclass
+class EAnnotation:
+    source: str                                    # annotation source URI/key
+    details: dict = field(default_factory=dict)    # key -> value pairs
+
+@dataclass
 class EEnumLiteral:
     name: str
     value: int = 0
@@ -47,6 +52,7 @@ class EEnum:
     name: str
     literals: list = field(default_factory=list)  # list[EEnumLiteral]
     package_name: str = ""
+    annotations: list = field(default_factory=list)  # list[EAnnotation]
 
 @dataclass
 class EAttribute:
@@ -56,6 +62,7 @@ class EAttribute:
     upper_bound: int = 1  # -1 means unbounded (repeated)
     default_value: Optional[str] = None
     source_hint: Optional[str] = None  # file/package hint from eType URI
+    annotations: list = field(default_factory=list)  # list[EAnnotation]
 
 @dataclass
 class EReference:
@@ -67,6 +74,7 @@ class EReference:
     opposite: Optional[str] = None
     resolved_package: Optional[str] = None  # Package where the type lives
     source_hint: Optional[str] = None  # file/package hint from eType URI
+    annotations: list = field(default_factory=list)  # list[EAnnotation]
 
 @dataclass
 class EClass:
@@ -78,6 +86,7 @@ class EClass:
     references: list = field(default_factory=list)    # list[EReference]
     package_name: str = ""
     resolved_supers: list = field(default_factory=list)  # list[(pkg, class_name)]
+    annotations: list = field(default_factory=list)  # list[EAnnotation]
 
 @dataclass
 class EDataType:
@@ -94,6 +103,7 @@ class EPackage:
     data_types: list = field(default_factory=list)     # list[EDataType]
     sub_packages: list = field(default_factory=list)   # list[EPackage]
     source_file: str = ""
+    annotations: list = field(default_factory=list)    # list[EAnnotation]
 
 
 # ─── Ecore Type → Proto Type Mapping ─────────────────────────────────────────
@@ -196,6 +206,7 @@ class EcoreParser:
             ns_uri=elem.get("nsURI", ""),
             ns_prefix=elem.get("nsPrefix", ""),
             source_file=filepath,
+            annotations=self._parse_annotations(elem),
         )
 
         for child in elem:
@@ -260,6 +271,7 @@ class EcoreParser:
             abstract=elem.get("abstract", "false").lower() == "true",
             interface=elem.get("interface", "false").lower() == "true",
             package_name=package_name,
+            annotations=self._parse_annotations(elem),
         )
 
         # Parse super types
@@ -306,6 +318,7 @@ class EcoreParser:
             upper_bound=int(elem.get("upperBound", "1")),
             default_value=elem.get("defaultValueLiteral"),
             source_hint=source_hint,
+            annotations=self._parse_annotations(elem),
         )
 
     def _parse_reference(self, elem) -> EReference:
@@ -320,12 +333,44 @@ class EcoreParser:
             upper_bound=int(elem.get("upperBound", "1")),
             opposite=elem.get("eOpposite"),
             source_hint=source_hint,
+            annotations=self._parse_annotations(elem),
         )
+
+    def _parse_annotations(self, elem) -> list:
+        """Parse all eAnnotations children of an element.
+
+        Ecore annotations look like:
+          <eAnnotations source="http://www.eclipse.org/emf/2002/GenModel">
+            <details key="documentation" value="This is the description"/>
+          </eAnnotations>
+          <eAnnotations source="http://example.com/ui">
+            <details key="label" value="Full Name"/>
+            <details key="tooltip" value="Enter your full legal name"/>
+            <details key="readonly" value="true"/>
+          </eAnnotations>
+        """
+        annotations = []
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if tag == "eAnnotations":
+                source = child.get("source", "")
+                details = {}
+                for detail in child:
+                    dtag = self._strip_ns(detail.tag)
+                    if dtag == "details":
+                        key = detail.get("key", "")
+                        value = detail.get("value", "")
+                        if key:
+                            details[key] = value
+                if details:
+                    annotations.append(EAnnotation(source=source, details=details))
+        return annotations
 
     def _parse_enum(self, elem, package_name: str) -> EEnum:
         enum = EEnum(
             name=elem.get("name", "UnknownEnum"),
             package_name=package_name,
+            annotations=self._parse_annotations(elem),
         )
         for child in elem:
             tag = self._strip_ns(child.tag)
@@ -552,16 +597,197 @@ class ReferenceResolver:
         return (type_name, source_hint)
 
 
+# ─── Annotation Collector & UI Options Generator ─────────────────────────────
+
+# Starting field number for custom extensions (protobuf convention: 50000+)
+_EXTENSION_FIELD_START = 50000
+
+def _infer_proto_type(values: set) -> str:
+    """Infer the best proto type from a set of observed annotation values."""
+    if not values:
+        return "string"
+    # Check if all values are boolean
+    if all(v.lower() in ("true", "false") for v in values):
+        return "bool"
+    # Check if all values are integers
+    if all(re.fullmatch(r'-?\d+', v) for v in values):
+        return "int32"
+    # Check if all values are floats
+    if all(re.fullmatch(r'-?\d+\.?\d*', v) for v in values):
+        return "double"
+    return "string"
+
+def _shorten_source(source: str) -> str:
+    """Convert an annotation source URI to a short readable name.
+
+    Examples:
+        'http://www.eclipse.org/emf/2002/GenModel' → 'genmodel'
+        'http://example.com/ui'                     → 'ui'
+        'http://example.com/constraints/validation' → 'validation'
+        'myCustomSource'                            → 'mycustomsource'
+    """
+    if not source:
+        return "unknown"
+    # Take the last meaningful path segment
+    # Strip trailing slashes, split by '/', take last non-empty part
+    cleaned = source.rstrip("/")
+    if "/" in cleaned:
+        last = cleaned.rsplit("/", 1)[-1]
+    else:
+        last = cleaned
+    # Clean up
+    last = re.sub(r'[^a-zA-Z0-9_]', '_', last).lower()
+    last = re.sub(r'_+', '_', last).strip('_')
+    return last or "unknown"
+
+
+@dataclass
+class AnnotationOptionDef:
+    """A single option field inside extend google.protobuf.FieldOptions."""
+    key: str              # original annotation detail key
+    field_name: str       # snake_case proto field name
+    proto_type: str       # inferred proto type (string, bool, int32, double)
+    field_number: int     # assigned extension field number
+    source_short: str     # shortened annotation source
+    source_full: str      # full annotation source URI
+
+
+class AnnotationCollector:
+    """Scans all packages and builds a registry of unique annotation detail keys.
+
+    Each unique (source, detail_key) pair becomes an extension field in the
+    generated ui_options.proto file.
+    """
+
+    def __init__(self):
+        # (source_short, key) -> AnnotationOptionDef
+        self.options: OrderedDict[tuple, AnnotationOptionDef] = OrderedDict()
+        # (source_short, key) -> set of observed values (for type inference)
+        self._value_samples: dict[tuple, set] = {}
+        self._next_field_number = _EXTENSION_FIELD_START
+
+    def scan_packages(self, packages: list):
+        """Walk all packages, classes, attributes, references to collect annotations."""
+        for pkg in packages:
+            self._scan_package(pkg)
+        # After scanning, finalize inferred types
+        self._finalize_types()
+
+    def _scan_package(self, pkg: EPackage):
+        for ann in pkg.annotations:
+            self._register_annotation(ann)
+        for cls in pkg.classes:
+            for ann in cls.annotations:
+                self._register_annotation(ann)
+            for attr in cls.attributes:
+                for ann in attr.annotations:
+                    self._register_annotation(ann)
+            for ref in cls.references:
+                for ann in ref.annotations:
+                    self._register_annotation(ann)
+        for enum in pkg.enums:
+            for ann in enum.annotations:
+                self._register_annotation(ann)
+        for sub in pkg.sub_packages:
+            self._scan_package(sub)
+
+    def _register_annotation(self, ann: EAnnotation):
+        source_short = _shorten_source(ann.source)
+        for key, value in ann.details.items():
+            lookup = (source_short, key)
+            if lookup not in self.options:
+                field_name = self._to_option_field_name(source_short, key)
+                self.options[lookup] = AnnotationOptionDef(
+                    key=key,
+                    field_name=field_name,
+                    proto_type="string",  # placeholder, finalized later
+                    field_number=self._next_field_number,
+                    source_short=source_short,
+                    source_full=ann.source,
+                )
+                self._value_samples[lookup] = set()
+                self._next_field_number += 1
+            self._value_samples[lookup].add(value)
+
+    def _finalize_types(self):
+        for lookup, opt in self.options.items():
+            opt.proto_type = _infer_proto_type(self._value_samples.get(lookup, set()))
+
+    @staticmethod
+    def _to_option_field_name(source_short: str, key: str) -> str:
+        """Build a unique, readable snake_case field name: source_key.
+
+        e.g., ('genmodel', 'documentation') → 'genmodel_documentation'
+              ('ui', 'label')               → 'ui_label'
+        """
+        raw = f"{source_short}_{key}"
+        s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', raw)
+        s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+        s = s.lower()
+        s = re.sub(r'[^a-z0-9_]', '_', s)
+        s = re.sub(r'_+', '_', s).strip('_')
+        return s
+
+    def has_annotations(self) -> bool:
+        return len(self.options) > 0
+
+    def get_option_for(self, ann: EAnnotation, key: str) -> Optional[AnnotationOptionDef]:
+        """Look up the option definition for a given annotation detail key."""
+        source_short = _shorten_source(ann.source)
+        return self.options.get((source_short, key))
+
+    def generate_ui_options_proto(self, proto_package_prefix: str = "") -> str:
+        """Generate the ui_options.proto file content."""
+        lines = []
+        lines.append('syntax = "proto3";')
+        lines.append("")
+
+        pkg_name = "ui"
+        if proto_package_prefix:
+            pkg_name = f"{proto_package_prefix}.ui"
+        lines.append(f"package {pkg_name};")
+        lines.append("")
+        lines.append('import "google/protobuf/descriptor.proto";')
+        lines.append("")
+
+        # Group options by source for readability
+        by_source: OrderedDict[str, list] = OrderedDict()
+        for (source_short, _), opt in self.options.items():
+            by_source.setdefault(source_short, []).append(opt)
+
+        lines.append("extend google.protobuf.FieldOptions {")
+        first_group = True
+        for source_short, opts in by_source.items():
+            if not first_group:
+                lines.append("")
+            # Comment with source group header and full URI
+            full_uri = opts[0].source_full
+            lines.append(f"  // Source: {full_uri}")
+            for opt in opts:
+                lines.append(
+                    f"  optional {opt.proto_type} {opt.field_name} = {opt.field_number};"
+                )
+            first_group = False
+        lines.append("}")
+        lines.append("")
+
+        return "\n".join(lines)
+
+
 # ─── Proto Generator ─────────────────────────────────────────────────────────
 
 class ProtoGenerator:
     """Generates .proto file content from parsed Ecore packages."""
 
+    UI_OPTIONS_FILENAME = "ui_options.proto"
+
     def __init__(self, all_packages: list, resolver: ReferenceResolver,
+                 annotation_collector: Optional[AnnotationCollector] = None,
                  java_package_prefix: str = "", go_package_prefix: str = "",
                  proto_package_prefix: str = ""):
         self.all_packages = all_packages
         self.resolver = resolver
+        self.annotations = annotation_collector
         self.java_package_prefix = java_package_prefix
         self.go_package_prefix = go_package_prefix
         self.proto_package_prefix = proto_package_prefix
@@ -569,6 +795,13 @@ class ProtoGenerator:
     def generate_all(self) -> dict:
         """Generate proto content for all packages. Returns {filename: content}."""
         result = OrderedDict()
+
+        # Generate ui_options.proto if annotations were found
+        if self.annotations and self.annotations.has_annotations():
+            result[self.UI_OPTIONS_FILENAME] = self.annotations.generate_ui_options_proto(
+                proto_package_prefix=self.proto_package_prefix,
+            )
+
         for pkg in self.all_packages:
             files = self._generate_package(pkg)
             result.update(files)
@@ -650,16 +883,20 @@ class ProtoGenerator:
     def _collect_imports(self, cls: EClass, current_pkg: EPackage) -> set:
         imports = set()
 
-        # Check attributes for well-known types
+        # Check attributes for well-known types and annotations
         for attr in cls.attributes:
             proto_type = self._resolve_attribute_type(attr, current_pkg)
             if proto_type in WELL_KNOWN_TYPE_IMPORTS:
                 imports.add(WELL_KNOWN_TYPE_IMPORTS[proto_type])
+            if attr.annotations and self.annotations and self.annotations.has_annotations():
+                imports.add(self.UI_OPTIONS_FILENAME)
 
-        # Check references for cross-package imports
+        # Check references for cross-package imports and annotations
         for ref in cls.references:
             if ref.resolved_package and ref.resolved_package != current_pkg.name:
                 imports.add(self._package_to_filename(ref.resolved_package))
+            if ref.annotations and self.annotations and self.annotations.has_annotations():
+                imports.add(self.UI_OPTIONS_FILENAME)
 
         # Check supers for cross-package imports
         for (super_pkg, super_name) in cls.resolved_supers:
@@ -697,6 +934,12 @@ class ProtoGenerator:
         if cls.interface:
             lines.append(f"// Interface: {cls.name}")
 
+        # Class-level annotation comments
+        if cls.annotations:
+            for ann in cls.annotations:
+                for key, value in ann.details.items():
+                    lines.append(f"// @{_shorten_source(ann.source)}.{key}: {value}")
+
         lines.append(f"message {msg_name} {{")
 
         field_number = 1
@@ -717,11 +960,18 @@ class ProtoGenerator:
             field_name = self._to_field_name(attr.name)
             repeated = "repeated " if attr.upper_bound == -1 else ""
 
+            options_str = self._format_field_options(attr.annotations)
             comment = ""
             if attr.default_value is not None:
                 comment = f"  // default: {attr.default_value}"
 
-            lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            if options_str:
+                lines.append(
+                    f"  {repeated}{proto_type} {field_name} = {field_number} "
+                    f"[{options_str}];{comment}"
+                )
+            else:
+                lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
             field_number += 1
 
         # References
@@ -730,6 +980,7 @@ class ProtoGenerator:
             field_name = self._to_field_name(ref.name)
             repeated = "repeated " if ref.upper_bound == -1 else ""
 
+            options_str = self._format_field_options(ref.annotations)
             comment_parts = []
             if ref.containment:
                 comment_parts.append("containment")
@@ -737,11 +988,34 @@ class ProtoGenerator:
                 comment_parts.append(f"opposite: {ref.opposite}")
             comment = f"  // {', '.join(comment_parts)}" if comment_parts else ""
 
-            lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            if options_str:
+                lines.append(
+                    f"  {repeated}{proto_type} {field_name} = {field_number} "
+                    f"[{options_str}];{comment}"
+                )
+            else:
+                lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
             field_number += 1
 
         lines.append("}")
         return lines
+
+    def _format_field_options(self, annotations: list) -> str:
+        """Format annotations as proto field options: (ui.field_name) = "value", ...
+
+        Returns empty string if no annotations or no collector.
+        """
+        if not annotations or not self.annotations:
+            return ""
+
+        parts = []
+        for ann in annotations:
+            for key, value in ann.details.items():
+                opt_def = self.annotations.get_option_for(ann, key)
+                if opt_def:
+                    formatted_value = self._format_option_value(value, opt_def.proto_type)
+                    parts.append(f"(ui.{opt_def.field_name}) = {formatted_value}")
+        return ", ".join(parts)
 
     def _resolve_attribute_type(self, attr: EAttribute, current_pkg: EPackage) -> str:
         type_name = attr.e_type
@@ -794,7 +1068,21 @@ class ProtoGenerator:
 
         return self._to_proto_name(type_name)
 
-    # ── Naming Helpers ────────────────────────────────────────────────────
+    # ── Naming & Formatting Helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _format_option_value(value: str, proto_type: str) -> str:
+        """Format an annotation value for proto field option syntax."""
+        if proto_type == "bool":
+            return value.lower()
+        elif proto_type in ("int32", "int64"):
+            return value
+        elif proto_type in ("float", "double"):
+            return value
+        else:
+            # String: escape quotes and wrap
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{escaped}"'
 
     def _to_proto_package(self, name: str) -> str:
         """Convert package name to proto package style."""
@@ -921,9 +1209,21 @@ def convert(ecore_files: list, output_dir: str = ".",
     resolver = ReferenceResolver(flat_packages)
     resolver.resolve()
 
+    # Collect annotations across all packages
+    annotation_collector = AnnotationCollector()
+    annotation_collector.scan_packages(flat_packages)
+
+    if verbose and annotation_collector.has_annotations():
+        print(f"\nFound {len(annotation_collector.options)} unique annotation option(s):",
+              file=sys.stderr)
+        for (src, key), opt in annotation_collector.options.items():
+            print(f"  - [{src}] {key} → {opt.proto_type} (field #{opt.field_number})",
+                  file=sys.stderr)
+
     # Generate proto files
     generator = ProtoGenerator(
         flat_packages, resolver,
+        annotation_collector=annotation_collector,
         java_package_prefix=java_package,
         go_package_prefix=go_package,
         proto_package_prefix=proto_package,
