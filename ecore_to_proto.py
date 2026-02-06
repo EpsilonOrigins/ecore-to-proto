@@ -670,8 +670,8 @@ class AnnotationCollector:
         """Walk all packages, classes, attributes, references to collect annotations."""
         for pkg in packages:
             self._scan_package(pkg)
-        # After scanning, finalize inferred types
-        self._finalize_types()
+        # After scanning, finalize inferred types and resolve field name collisions
+        self._finalize()
 
     def _scan_package(self, pkg: EPackage):
         for ann in pkg.annotations:
@@ -696,10 +696,9 @@ class AnnotationCollector:
         for key, value in ann.details.items():
             lookup = (source_short, key)
             if lookup not in self.options:
-                field_name = self._to_option_field_name(source_short, key)
                 self.options[lookup] = AnnotationOptionDef(
                     key=key,
-                    field_name=field_name,
+                    field_name="",  # assigned during _finalize
                     proto_type="string",  # placeholder, finalized later
                     field_number=self._next_field_number,
                     source_short=source_short,
@@ -709,18 +708,32 @@ class AnnotationCollector:
                 self._next_field_number += 1
             self._value_samples[lookup].add(value)
 
-    def _finalize_types(self):
+    def _finalize(self):
+        """Finalize inferred types and assign field names, prefixing only on collision."""
+        # Detect which raw keys appear under multiple sources
+        key_to_sources: dict[str, set] = {}
+        for (source_short, key) in self.options:
+            key_to_sources.setdefault(key, set()).add(source_short)
+
         for lookup, opt in self.options.items():
+            source_short, key = lookup
+            # Infer proto type
             opt.proto_type = _infer_proto_type(self._value_samples.get(lookup, set()))
+            # Only prefix with source when the same key exists under multiple sources
+            needs_prefix = len(key_to_sources.get(key, set())) > 1
+            opt.field_name = self._to_option_field_name(
+                source_short if needs_prefix else "", key
+            )
 
     @staticmethod
     def _to_option_field_name(source_short: str, key: str) -> str:
-        """Build a unique, readable snake_case field name: source_key.
+        """Build a snake_case field name, only prefixing with source on collision.
 
-        e.g., ('genmodel', 'documentation') → 'genmodel_documentation'
-              ('ui', 'label')               → 'ui_label'
+        e.g., ('', 'displayName')          → 'display_name'
+              ('', 'documentation')        → 'documentation'
+              ('genmodel', 'documentation') → 'genmodel_documentation'  (collision)
         """
-        raw = f"{source_short}_{key}"
+        raw = f"{source_short}_{key}" if source_short else key
         s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', raw)
         s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
         s = s.lower()
