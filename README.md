@@ -12,6 +12,7 @@ A Python tool that converts Eclipse EMF Ecore (`.ecore`) model files into Protoc
 - **Well-known type imports** — `EDate` maps to `google.protobuf.Timestamp`, with the correct import generated automatically
 - **Cross-package imports** — references between packages produce the correct `import` and qualified type names
 - **Metadata preservation** — containment, opposites, abstract markers, and default values are retained as comments
+- **EAnnotation → FieldOptions** — all `eAnnotations` detail entries are collected into a single `ui_options.proto` with `extend google.protobuf.FieldOptions`, and applied as field options on annotated fields
 - **Sub-package flattening** — nested `eSubpackages` each produce their own `.proto` file
 
 ## Requirements
@@ -35,6 +36,10 @@ python ecore_to_proto.py ./models/ -o output/ \
     --java-package com.example \
     --go-package github.com/org/pkg \
     --proto-package com.example
+
+# Custom annotation options package (default: ui → ui_options.proto)
+python ecore_to_proto.py ./models/ -o output/ --options-package common
+# → generates common_options.proto, fields use (common.label) = "..."
 ```
 
 ### CLI Options
@@ -46,6 +51,7 @@ python ecore_to_proto.py ./models/ -o output/ \
 | `--java-package` | Java package prefix added as `option java_package` |
 | `--go-package` | Go package prefix added as `option go_package` |
 | `--proto-package` | Prefix prepended to the `package` declaration |
+| `--options-package` | Package name for annotation field options proto (default: `ui` → `ui_options.proto`) |
 | `-v`, `--verbose` | Print parsing and generation details to stderr |
 
 ### Programmatic Use
@@ -56,6 +62,7 @@ from ecore_to_proto import convert
 proto_files = convert(
     ecore_files=["base.ecore", "domain.ecore"],
     output_dir="proto_out/",
+    options_package="common",   # default: "ui"
     java_package="com.example",
     verbose=True,
 )
@@ -90,6 +97,22 @@ proto_files = convert(
 | `upperBound="-1"` | `repeated` field |
 | `defaultValueLiteral` | Preserved as `// default: <value>` comment |
 | `eOpposite` | Preserved as `// opposite: <path>` comment |
+
+### Annotations (EAnnotations)
+
+Ecore `eAnnotations` on structural features (attributes, references) are captured as protobuf **custom field options** via `extend google.protobuf.FieldOptions`.
+
+All unique annotation detail keys discovered across the entire model tree are collected into a single generated file, `ui_options.proto`. Each unique `(source, key)` pair becomes one extension field. The proto type is inferred from observed values (`"true"`/`"false"` → `bool`, integers → `int32`, otherwise `string`).
+
+| Ecore | Proto |
+|---|---|
+| `eAnnotations` on a field | `[(ui.source_key) = "value"]` field option |
+| `eAnnotations` on an `EClass` | `// @source.key: value` comment above the message |
+| All unique detail keys | `extend google.protobuf.FieldOptions { ... }` in `ui_options.proto` |
+
+Field numbers for extensions start at `50000` (protobuf convention for custom extensions).
+
+If **no** annotations are present in any input file, `ui_options.proto` is not generated.
 
 ### Inheritance
 
@@ -198,14 +221,67 @@ message Employee {
 }
 ```
 
+## Example: Annotations
+
+Given an Ecore file with `eAnnotations` on fields:
+
+```xml
+<eStructuralFeatures xsi:type="ecore:EAttribute" name="email"
+    eType="ecore:EDataType http://...#//EString">
+  <eAnnotations source="http://example.com/ui">
+    <details key="label" value="Email Address"/>
+    <details key="readonly" value="true"/>
+  </eAnnotations>
+  <eAnnotations source="http://example.com/constraints">
+    <details key="pattern" value="^[a-zA-Z0-9+_.-]+@[a-zA-Z0-9.-]+$"/>
+    <details key="required" value="true"/>
+  </eAnnotations>
+</eStructuralFeatures>
+```
+
+The converter produces **ui_options.proto**:
+
+```protobuf
+syntax = "proto3";
+
+package ui;
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FieldOptions {
+  // Source: http://example.com/ui
+  optional string ui_label = 50001;
+  optional bool ui_readonly = 50003;
+
+  // Source: http://example.com/constraints
+  optional string constraints_pattern = 50006;
+  optional bool constraints_required = 50007;
+}
+```
+
+And the field in the message proto becomes:
+
+```protobuf
+import "ui_options.proto";
+
+message Employee {
+  string email = 4 [
+    (ui.ui_label) = "Email Address",
+    (ui.ui_readonly) = true,
+    (ui.constraints_pattern) = "^[a-zA-Z0-9+_.-]+@[a-zA-Z0-9.-]+$",
+    (ui.constraints_required) = true
+  ];
+}
+```
+
 ## Limitations and Notes
 
 - **Inheritance is composition, not flattening.** Fields from parent classes are not duplicated into children; instead, a single embedded parent message is included. This keeps proto files DRY but means accessors go through an extra level (e.g., `org.named_element.name`).
-- **EAnnotations are not processed.** GenModel annotations, documentation annotations, and custom metadata are currently ignored.
 - **EOperations are skipped.** Proto messages are data-only; Ecore operations have no proto equivalent.
 - **Map detection is not automatic.** Ecore patterns that represent maps (e.g., `EStringToStringMapEntry`) are not converted to proto `map<K, V>` fields — they appear as regular messages.
 - **No `oneof` generation.** Ecore union-like patterns are not detected. Consider post-processing if your model uses these.
 - **Filename collisions.** If two packages produce the same snake_case filename, the second will overwrite the first. Use distinct package names to avoid this.
+- **Annotation type inference is best-effort.** Types are inferred from observed values; if a key has mixed types across files, `string` is used as fallback.
 
 ## License
 
