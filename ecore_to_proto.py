@@ -749,15 +749,16 @@ class AnnotationCollector:
         source_short = _shorten_source(ann.source)
         return self.options.get((source_short, key))
 
-    def generate_ui_options_proto(self, proto_package_prefix: str = "") -> str:
-        """Generate the ui_options.proto file content."""
+    def generate_ui_options_proto(self, options_package: str = "ui",
+                                    proto_package_prefix: str = "") -> str:
+        """Generate the options proto file content."""
         lines = []
         lines.append('syntax = "proto3";')
         lines.append("")
 
-        pkg_name = "ui"
+        pkg_name = options_package
         if proto_package_prefix:
-            pkg_name = f"{proto_package_prefix}.ui"
+            pkg_name = f"{proto_package_prefix}.{options_package}"
         lines.append(f"package {pkg_name};")
         lines.append("")
         lines.append('import "google/protobuf/descriptor.proto";')
@@ -792,15 +793,16 @@ class AnnotationCollector:
 class ProtoGenerator:
     """Generates .proto file content from parsed Ecore packages."""
 
-    UI_OPTIONS_FILENAME = "ui_options.proto"
-
     def __init__(self, all_packages: list, resolver: ReferenceResolver,
                  annotation_collector: Optional[AnnotationCollector] = None,
+                 options_package: str = "ui",
                  java_package_prefix: str = "", go_package_prefix: str = "",
                  proto_package_prefix: str = ""):
         self.all_packages = all_packages
         self.resolver = resolver
         self.annotations = annotation_collector
+        self.options_package = options_package
+        self.options_filename = f"{options_package}_options.proto"
         self.java_package_prefix = java_package_prefix
         self.go_package_prefix = go_package_prefix
         self.proto_package_prefix = proto_package_prefix
@@ -809,9 +811,10 @@ class ProtoGenerator:
         """Generate proto content for all packages. Returns {filename: content}."""
         result = OrderedDict()
 
-        # Generate ui_options.proto if annotations were found
+        # Generate options proto if annotations were found
         if self.annotations and self.annotations.has_annotations():
-            result[self.UI_OPTIONS_FILENAME] = self.annotations.generate_ui_options_proto(
+            result[self.options_filename] = self.annotations.generate_ui_options_proto(
+                options_package=self.options_package,
                 proto_package_prefix=self.proto_package_prefix,
             )
 
@@ -902,14 +905,14 @@ class ProtoGenerator:
             if proto_type in WELL_KNOWN_TYPE_IMPORTS:
                 imports.add(WELL_KNOWN_TYPE_IMPORTS[proto_type])
             if attr.annotations and self.annotations and self.annotations.has_annotations():
-                imports.add(self.UI_OPTIONS_FILENAME)
+                imports.add(self.options_filename)
 
         # Check references for cross-package imports and annotations
         for ref in cls.references:
             if ref.resolved_package and ref.resolved_package != current_pkg.name:
                 imports.add(self._package_to_filename(ref.resolved_package))
             if ref.annotations and self.annotations and self.annotations.has_annotations():
-                imports.add(self.UI_OPTIONS_FILENAME)
+                imports.add(self.options_filename)
 
         # Check supers for cross-package imports
         for (super_pkg, super_name) in cls.resolved_supers:
@@ -973,18 +976,15 @@ class ProtoGenerator:
             field_name = self._to_field_name(attr.name)
             repeated = "repeated " if attr.upper_bound == -1 else ""
 
-            options_str = self._format_field_options(attr.annotations)
+            option_parts = self._collect_field_options(attr.annotations)
             comment = ""
             if attr.default_value is not None:
                 comment = f"  // default: {attr.default_value}"
 
-            if options_str:
-                lines.append(
-                    f"  {repeated}{proto_type} {field_name} = {field_number} "
-                    f"[{options_str}];{comment}"
-                )
-            else:
-                lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            lines.extend(self._format_field_line(
+                f"{repeated}{proto_type}", field_name, field_number,
+                option_parts, comment
+            ))
             field_number += 1
 
         # References
@@ -993,7 +993,7 @@ class ProtoGenerator:
             field_name = self._to_field_name(ref.name)
             repeated = "repeated " if ref.upper_bound == -1 else ""
 
-            options_str = self._format_field_options(ref.annotations)
+            option_parts = self._collect_field_options(ref.annotations)
             comment_parts = []
             if ref.containment:
                 comment_parts.append("containment")
@@ -1001,25 +1001,23 @@ class ProtoGenerator:
                 comment_parts.append(f"opposite: {ref.opposite}")
             comment = f"  // {', '.join(comment_parts)}" if comment_parts else ""
 
-            if options_str:
-                lines.append(
-                    f"  {repeated}{proto_type} {field_name} = {field_number} "
-                    f"[{options_str}];{comment}"
-                )
-            else:
-                lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            lines.extend(self._format_field_line(
+                f"{repeated}{proto_type}", field_name, field_number,
+                option_parts, comment
+            ))
             field_number += 1
 
         lines.append("}")
         return lines
 
-    def _format_field_options(self, annotations: list) -> str:
-        """Format annotations as proto field options: (ui.field_name) = "value", ...
+    def _collect_field_options(self, annotations: list) -> list:
+        """Collect annotation options as a list of formatted option strings.
 
-        Returns empty string if no annotations or no collector.
+        Returns list like:
+            ['(ui.label) = "Email Address"', '(ui.readonly) = true']
         """
         if not annotations or not self.annotations:
-            return ""
+            return []
 
         parts = []
         for ann in annotations:
@@ -1027,8 +1025,35 @@ class ProtoGenerator:
                 opt_def = self.annotations.get_option_for(ann, key)
                 if opt_def:
                     formatted_value = self._format_option_value(value, opt_def.proto_type)
-                    parts.append(f"(ui.{opt_def.field_name}) = {formatted_value}")
-        return ", ".join(parts)
+                    parts.append(f"({self.options_package}.{opt_def.field_name}) = {formatted_value}")
+        return parts
+
+    def _format_field_line(self, type_str: str, field_name: str,
+                           field_number: int, option_parts: list,
+                           comment: str) -> list:
+        """Format a field declaration with options.
+
+        Single option  → inline:   string name = 1 [(ui.label) = "Name"];
+        Multiple opts  → block:    string email = 4 [
+                                     (ui.label) = "Email",
+                                     (ui.required) = true
+                                   ];
+        No options     → plain:    string name = 1;
+        """
+        if not option_parts:
+            return [f"  {type_str} {field_name} = {field_number};{comment}"]
+
+        if len(option_parts) == 1:
+            return [f"  {type_str} {field_name} = {field_number} [{option_parts[0]}];{comment}"]
+
+        # Multi-line block format
+        lines = []
+        lines.append(f"  {type_str} {field_name} = {field_number} [")
+        for i, opt in enumerate(option_parts):
+            comma = "," if i < len(option_parts) - 1 else ""
+            lines.append(f"    {opt}{comma}")
+        lines.append(f"  ];{comment}")
+        return lines
 
     def _resolve_attribute_type(self, attr: EAttribute, current_pkg: EPackage) -> str:
         type_name = attr.e_type
@@ -1184,6 +1209,7 @@ def find_ecore_files(paths: list) -> list:
 
 
 def convert(ecore_files: list, output_dir: str = ".",
+            options_package: str = "ui",
             java_package: str = "", go_package: str = "",
             proto_package: str = "", verbose: bool = False) -> dict:
     """
@@ -1237,6 +1263,7 @@ def convert(ecore_files: list, output_dir: str = ".",
     generator = ProtoGenerator(
         flat_packages, resolver,
         annotation_collector=annotation_collector,
+        options_package=options_package,
         java_package_prefix=java_package,
         go_package_prefix=go_package,
         proto_package_prefix=proto_package,
@@ -1274,6 +1301,9 @@ def main():
                         help="Go package prefix for generated protos")
     parser.add_argument("--proto-package", default="",
                         help="Proto package prefix")
+    parser.add_argument("--options-package", default="ui",
+                        help="Package name for annotation field options proto "
+                             "(default: ui → ui_options.proto)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print verbose output")
 
@@ -1292,6 +1322,7 @@ def main():
     proto_files = convert(
         ecore_files,
         output_dir=args.output_dir,
+        options_package=args.options_package,
         java_package=args.java_package,
         go_package=args.go_package,
         proto_package=args.proto_package,
