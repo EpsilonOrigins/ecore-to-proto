@@ -55,6 +55,7 @@ class EAttribute:
     lower_bound: int = 0
     upper_bound: int = 1  # -1 means unbounded (repeated)
     default_value: Optional[str] = None
+    source_hint: Optional[str] = None  # file/package hint from eType URI
 
 @dataclass
 class EReference:
@@ -65,6 +66,7 @@ class EReference:
     upper_bound: int = 1  # -1 means unbounded (repeated)
     opposite: Optional[str] = None
     resolved_package: Optional[str] = None  # Package where the type lives
+    source_hint: Optional[str] = None  # file/package hint from eType URI
 
 @dataclass
 class EClass:
@@ -295,7 +297,7 @@ class EcoreParser:
 
     def _parse_attribute(self, elem) -> EAttribute:
         etype_raw = elem.get("eType", "")
-        type_name = self._extract_type_name(etype_raw)
+        type_name, source_hint = self._extract_type_info(etype_raw)
 
         return EAttribute(
             name=elem.get("name", "unknown"),
@@ -303,11 +305,12 @@ class EcoreParser:
             lower_bound=int(elem.get("lowerBound", "0")),
             upper_bound=int(elem.get("upperBound", "1")),
             default_value=elem.get("defaultValueLiteral"),
+            source_hint=source_hint,
         )
 
     def _parse_reference(self, elem) -> EReference:
         etype_raw = elem.get("eType", "")
-        type_name = self._extract_type_name(etype_raw)
+        type_name, source_hint = self._extract_type_info(etype_raw)
 
         return EReference(
             name=elem.get("name", "unknown"),
@@ -316,6 +319,7 @@ class EcoreParser:
             lower_bound=int(elem.get("lowerBound", "0")),
             upper_bound=int(elem.get("upperBound", "1")),
             opposite=elem.get("eOpposite"),
+            source_hint=source_hint,
         )
 
     def _parse_enum(self, elem, package_name: str) -> EEnum:
@@ -339,37 +343,85 @@ class EcoreParser:
             instance_class_name=elem.get("instanceClassName") or elem.get("instanceTypeName"),
         )
 
-    def _extract_type_name(self, etype_raw: str) -> str:
-        """Extract a usable type name from eType attribute values like:
-        - '#//MyClass'
-        - 'ecore:EDataType http://www.eclipse.org/emf/2002/Ecore#//EString'
-        - 'othermodel.ecore#//SomeClass'
-        - '#//packageName/ClassName'
+    def _extract_type_info(self, etype_raw: str) -> tuple:
+        """Extract (type_name, source_hint) from eType attribute values.
+
+        source_hint is the file/package prefix that tells us where the type lives:
+        - '#//MyClass'                      → ('MyClass', None)         — same file
+        - 'assetcommon.ecore#//Logging'     → ('Logging', 'assetcommon')
+        - 'ecore:EDataType http://...#//EString' → ('EString', None)   — built-in
+        - '#//packageName/ClassName'        → ('ClassName', None)       — same file subpackage
         """
         if not etype_raw:
-            return "EString"  # default
+            return ("EString", None)
 
-        # Handle 'ecore:EDataType http://..../Ecore#//EString' form
+        source_hint = None
+
         if "#//" in etype_raw:
-            after_hash = etype_raw.split("#//")[-1]
-            # Could be 'EString' or 'package/ClassName'
-            return after_hash.split("/")[-1].strip()
+            # Split on '#//' — left side has the file reference, right side has the type path
+            left, right = etype_raw.rsplit("#//", 1)
+            type_name = right.split("/")[-1].strip()
 
-        # Plain type name
+            # Extract source hint from left side
+            # Could be: '', 'assetcommon.ecore', 'ecore:EDataType http://.../Ecore',
+            #           '../other/path/model.ecore', 'platform:/resource/proj/model.ecore'
+            left = left.strip()
+            if left and "eclipse.org/emf" not in left and "www.w3.org" not in left:
+                # Strip any 'ecore:EClass' or 'ecore:EDataType' prefix
+                if " " in left:
+                    left = left.split()[-1]
+                # Get the filename stem (without path and extension)
+                # 'assetcommon.ecore' -> 'assetcommon'
+                # '../models/assetcommon.ecore' -> 'assetcommon'
+                # 'platform:/resource/proj/assetcommon.ecore' -> 'assetcommon'
+                basename = left.rsplit("/", 1)[-1]  # get filename part
+                if "." in basename:
+                    source_hint = basename.rsplit(".", 1)[0]  # strip extension
+                else:
+                    source_hint = basename
+                if source_hint:
+                    source_hint = source_hint.strip()
+
+            return (type_name, source_hint)
+
+        # Plain type name (no '#//')
         parts = etype_raw.split()
-        return parts[-1].strip()
+        return (parts[-1].strip(), None)
+
+    def _extract_type_name(self, etype_raw: str) -> str:
+        """Convenience wrapper returning just the type name."""
+        type_name, _ = self._extract_type_info(etype_raw)
+        return type_name
 
 
 # ─── Cross-Reference Resolver ────────────────────────────────────────────────
 
 class ReferenceResolver:
-    """Resolves cross-references between packages from multiple ecore files."""
+    """Resolves cross-references between packages from multiple ecore files.
+
+    Uses source hints from eType URIs (e.g., 'assetcommon.ecore#//Logging')
+    to disambiguate when multiple packages define a type with the same name.
+
+    Resolution priority:
+      1. Qualified name match (e.g., 'assetcommon.Logging')
+      2. Source hint from eType URI matches a package/file
+      3. Same-package match (type defined in the current package)
+      4. First registered match (fallback)
+    """
 
     def __init__(self, packages: list):
         self.packages = packages  # list[EPackage]
-        self.class_index = {}     # class_name -> package_name
-        self.enum_index = {}      # enum_name -> package_name
-        self.datatype_index = {}  # datatype_name -> instance_class_name
+
+        # name -> [pkg_name, ...] — all packages that define this class/enum
+        self.class_index: dict[str, list[str]] = {}
+        self.enum_index: dict[str, list[str]] = {}
+        self.datatype_index: dict[str, str] = {}  # datatype_name -> instance_class_name
+
+        # Maps file stems and package names so we can resolve source hints
+        # e.g., 'assetcommon' -> 'assetcommon' (trivial), but also handles
+        # cases where the filename differs from the package name
+        self.file_stem_to_package: dict[str, str] = {}
+
         self._build_indices()
 
     def _build_indices(self):
@@ -377,19 +429,67 @@ class ReferenceResolver:
             self._index_package(pkg)
 
     def _index_package(self, pkg: EPackage):
+        # Map file stem -> package name
+        if pkg.source_file:
+            stem = Path(pkg.source_file).stem  # 'assetcommon.ecore' -> 'assetcommon'
+            self.file_stem_to_package[stem] = pkg.name
+        # Also map package name to itself for direct matches
+        self.file_stem_to_package[pkg.name] = pkg.name
+
         for cls in pkg.classes:
-            key = cls.name
-            self.class_index[key] = pkg.name
-            # Also index with package prefix for disambiguation
-            self.class_index[f"{pkg.name}.{cls.name}"] = pkg.name
+            self.class_index.setdefault(cls.name, [])
+            if pkg.name not in self.class_index[cls.name]:
+                self.class_index[cls.name].append(pkg.name)
         for enum in pkg.enums:
-            self.enum_index[enum.name] = pkg.name
-            self.enum_index[f"{pkg.name}.{enum.name}"] = pkg.name
+            self.enum_index.setdefault(enum.name, [])
+            if pkg.name not in self.enum_index[enum.name]:
+                self.enum_index[enum.name].append(pkg.name)
         for dt in pkg.data_types:
             if dt.instance_class_name:
                 self.datatype_index[dt.name] = dt.instance_class_name
         for sub in pkg.sub_packages:
             self._index_package(sub)
+
+    def resolve_type(self, type_name: str, source_hint: Optional[str],
+                     current_pkg_name: str, index: dict) -> Optional[str]:
+        """Resolve a type name to the correct package using disambiguation.
+
+        Args:
+            type_name: The unqualified type name (e.g., 'Logging')
+            source_hint: File stem hint from the eType URI (e.g., 'assetcommon'), or None
+            current_pkg_name: Name of the package where the reference lives
+            index: The class_index or enum_index to search
+
+        Returns:
+            The resolved package name, or None if not found.
+        """
+        candidates = index.get(type_name, [])
+
+        if not candidates:
+            return None
+
+        # Only one match — no ambiguity
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiple candidates — disambiguate
+
+        # 1. Source hint match: URI said 'assetcommon.ecore#//Logging'
+        if source_hint:
+            # The hint might be a file stem that maps to a package name
+            hinted_pkg = self.file_stem_to_package.get(source_hint)
+            if hinted_pkg and hinted_pkg in candidates:
+                return hinted_pkg
+            # Or the hint might directly be a package name
+            if source_hint in candidates:
+                return source_hint
+
+        # 2. Same-package match
+        if current_pkg_name in candidates:
+            return current_pkg_name
+
+        # 3. Fallback to first registered
+        return candidates[0]
 
     def resolve(self):
         """Resolve all cross-references in all packages."""
@@ -400,27 +500,56 @@ class ReferenceResolver:
         for cls in pkg.classes:
             # Resolve super types
             for st in cls.super_types:
-                type_name = self._extract_type_from_uri(st)
-                target_pkg = self.class_index.get(type_name, pkg.name)
-                cls.resolved_supers.append((target_pkg, type_name))
+                type_name, source_hint = self._extract_type_info_from_uri(st)
+                target_pkg = self.resolve_type(
+                    type_name, source_hint, pkg.name, self.class_index
+                )
+                cls.resolved_supers.append((target_pkg or pkg.name, type_name))
 
             # Resolve references
             for ref in cls.references:
-                type_name = ref.e_type
-                if type_name in self.class_index:
-                    ref.resolved_package = self.class_index[type_name]
-                elif type_name in self.enum_index:
-                    ref.resolved_package = self.enum_index[type_name]
+                resolved = self.resolve_type(
+                    ref.e_type, ref.source_hint, pkg.name, self.class_index
+                )
+                if resolved:
+                    ref.resolved_package = resolved
                 else:
-                    ref.resolved_package = pkg.name  # assume same package
+                    # Try enum index
+                    resolved = self.resolve_type(
+                        ref.e_type, ref.source_hint, pkg.name, self.enum_index
+                    )
+                    ref.resolved_package = resolved or pkg.name
 
         for sub in pkg.sub_packages:
             self._resolve_package(sub)
 
-    def _extract_type_from_uri(self, uri: str) -> str:
+    def _extract_type_info_from_uri(self, uri: str) -> tuple:
+        """Extract (type_name, source_hint) from a raw eSuperTypes URI.
+
+        Examples:
+            '#//NamedElement'                  → ('NamedElement', None)
+            'assetcommon.ecore#//Logging'      → ('Logging', 'assetcommon')
+            'base.ecore#//NamedElement'        → ('NamedElement', 'base')
+        """
+        source_hint = None
+        type_name = uri
+
         if "#//" in uri:
-            return uri.split("#//")[-1].split("/")[-1]
-        return uri.split("/")[-1]
+            left, right = uri.rsplit("#//", 1)
+            type_name = right.split("/")[-1].strip()
+
+            left = left.strip()
+            if left:
+                # Get file stem from paths like '../models/assetcommon.ecore'
+                basename = left.rsplit("/", 1)[-1]
+                if "." in basename:
+                    source_hint = basename.rsplit(".", 1)[0]
+                else:
+                    source_hint = basename
+        else:
+            type_name = uri.split("/")[-1]
+
+        return (type_name, source_hint)
 
 
 # ─── Proto Generator ─────────────────────────────────────────────────────────
@@ -458,8 +587,15 @@ class ProtoGenerator:
         return result
 
     def _package_to_filename(self, name: str) -> str:
-        # Convert CamelCase to snake_case
-        s = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+        # Convert CamelCase/UPPER_CASE to snake_case
+        if name == name.upper() or '_' in name:
+            s = name.lower()
+        else:
+            s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+            s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+            s = s.lower()
+        s = re.sub(r'[^a-z0-9_]', '_', s)
+        s = re.sub(r'_+', '_', s).strip('_')
         return f"{s}.proto"
 
     def _generate_proto_file(self, pkg: EPackage) -> str:
@@ -610,7 +746,7 @@ class ProtoGenerator:
     def _resolve_attribute_type(self, attr: EAttribute, current_pkg: EPackage) -> str:
         type_name = attr.e_type
 
-        # Direct mapping
+        # Direct mapping (built-in Ecore types)
         if type_name in ECORE_TO_PROTO_TYPE:
             return ECORE_TO_PROTO_TYPE[type_name]
 
@@ -625,9 +761,11 @@ class ProtoGenerator:
             if enum.name == type_name:
                 return self._to_proto_name(type_name)
 
-        # Check global enum index
-        if type_name in self.resolver.enum_index:
-            enum_pkg = self.resolver.enum_index[type_name]
+        # Check global enum index (with disambiguation)
+        enum_pkg = self.resolver.resolve_type(
+            type_name, attr.source_hint, current_pkg.name, self.resolver.enum_index
+        )
+        if enum_pkg:
             if enum_pkg == current_pkg.name:
                 return self._to_proto_name(type_name)
             else:
@@ -672,10 +810,20 @@ class ProtoGenerator:
         return name[0].upper() + name[1:]
 
     def _to_field_name(self, name: str) -> str:
-        """Convert to snake_case for proto field names."""
-        # Insert underscore before uppercase letters
-        s = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
-        # Clean up
+        """Convert to snake_case for proto field names.
+        Handles camelCase, PascalCase, UPPER_SNAKE_CASE, and ALL_CAPS correctly.
+        """
+        # If already snake_case or UPPER_SNAKE_CASE, just lowercase it
+        if name == name.upper() or '_' in name:
+            s = name.lower()
+        else:
+            # CamelCase / PascalCase: insert underscores at boundaries
+            # Between lowercase/digit and uppercase: "employeeCount" -> "employee_Count"
+            s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+            # Between uppercase run and uppercase+lowercase: "XMLParser" -> "XML_Parser"
+            s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+            s = s.lower()
+        # Clean up non-alphanumeric characters
         s = re.sub(r'[^a-z0-9_]', '_', s)
         s = re.sub(r'_+', '_', s).strip('_')
         # Ensure it doesn't start with a digit
