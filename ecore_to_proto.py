@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""
+Ecore to Protocol Buffers (.proto) Converter
+
+Converts Eclipse EMF Ecore (.ecore) files into Protocol Buffer v3 (.proto) files.
+Handles multiple interdependent Ecore files, cross-references, inheritance (via
+composition), enums, and data type mapping.
+
+Usage:
+    python ecore_to_proto.py input1.ecore input2.ecore ... [-o output_dir]
+    python ecore_to_proto.py ./models/ [-o output_dir]
+"""
+
+import argparse
+import os
+import sys
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Optional
+from pathlib import Path
+from collections import OrderedDict
+
+
+# ─── Ecore XMI Namespaces ────────────────────────────────────────────────────
+
+ECORE_NS = "http://www.eclipse.org/emf/2002/Ecore"
+XMI_NS = "http://www.omg.org/XMI"
+XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+
+NS = {
+    "ecore": ECORE_NS,
+    "xmi": XMI_NS,
+    "xsi": XSI_NS,
+}
+
+
+# ─── Data Model ──────────────────────────────────────────────────────────────
+
+@dataclass
+class EEnumLiteral:
+    name: str
+    value: int = 0
+
+@dataclass
+class EEnum:
+    name: str
+    literals: list = field(default_factory=list)  # list[EEnumLiteral]
+    package_name: str = ""
+
+@dataclass
+class EAttribute:
+    name: str
+    e_type: str  # Ecore type string (e.g., "EString", "EInt")
+    lower_bound: int = 0
+    upper_bound: int = 1  # -1 means unbounded (repeated)
+    default_value: Optional[str] = None
+
+@dataclass
+class EReference:
+    name: str
+    e_type: str  # Referenced EClass name (possibly cross-package)
+    containment: bool = False
+    lower_bound: int = 0
+    upper_bound: int = 1  # -1 means unbounded (repeated)
+    opposite: Optional[str] = None
+    resolved_package: Optional[str] = None  # Package where the type lives
+
+@dataclass
+class EClass:
+    name: str
+    abstract: bool = False
+    interface: bool = False
+    super_types: list = field(default_factory=list)  # list[str]
+    attributes: list = field(default_factory=list)   # list[EAttribute]
+    references: list = field(default_factory=list)    # list[EReference]
+    package_name: str = ""
+    resolved_supers: list = field(default_factory=list)  # list[(pkg, class_name)]
+
+@dataclass
+class EDataType:
+    name: str
+    instance_class_name: Optional[str] = None
+
+@dataclass
+class EPackage:
+    name: str
+    ns_uri: str = ""
+    ns_prefix: str = ""
+    classes: list = field(default_factory=list)       # list[EClass]
+    enums: list = field(default_factory=list)          # list[EEnum]
+    data_types: list = field(default_factory=list)     # list[EDataType]
+    sub_packages: list = field(default_factory=list)   # list[EPackage]
+    source_file: str = ""
+
+
+# ─── Ecore Type → Proto Type Mapping ─────────────────────────────────────────
+
+ECORE_TO_PROTO_TYPE = {
+    # Ecore built-in types
+    "EString": "string",
+    "EInt": "int32",
+    "EInteger": "int32",
+    "ELong": "int64",
+    "EFloat": "float",
+    "EDouble": "double",
+    "EBoolean": "bool",
+    "EByte": "int32",
+    "EShort": "int32",
+    "EChar": "string",
+    "EDate": "google.protobuf.Timestamp",
+    "EBigInteger": "int64",
+    "EBigDecimal": "string",  # no native proto equivalent
+    "EByteArray": "bytes",
+    "EResource": "string",
+    "EJavaObject": "google.protobuf.Any",
+    "EJavaClass": "string",
+    "EFeatureMapEntry": "google.protobuf.Any",
+    "EMap": "google.protobuf.Struct",
+    "EEList": "google.protobuf.ListValue",
+    "ETreeIterator": "string",
+    "EEnumerator": "int32",
+
+    # Java primitive type names (from instanceClassName)
+    "java.lang.String": "string",
+    "java.lang.Integer": "int32",
+    "java.lang.Long": "int64",
+    "java.lang.Float": "float",
+    "java.lang.Double": "double",
+    "java.lang.Boolean": "bool",
+    "java.lang.Byte": "int32",
+    "java.lang.Short": "int32",
+    "java.lang.Character": "string",
+    "java.util.Date": "google.protobuf.Timestamp",
+    "java.math.BigInteger": "int64",
+    "java.math.BigDecimal": "string",
+    "int": "int32",
+    "long": "int64",
+    "float": "float",
+    "double": "double",
+    "boolean": "bool",
+    "byte": "int32",
+    "short": "int32",
+    "char": "string",
+}
+
+# Well-known proto types that require imports
+WELL_KNOWN_TYPE_IMPORTS = {
+    "google.protobuf.Timestamp": "google/protobuf/timestamp.proto",
+    "google.protobuf.Any": "google/protobuf/any.proto",
+    "google.protobuf.Struct": "google/protobuf/struct.proto",
+    "google.protobuf.ListValue": "google/protobuf/struct.proto",
+}
+
+
+# ─── Parser ──────────────────────────────────────────────────────────────────
+
+class EcoreParser:
+    """Parses .ecore (XMI/XML) files into our data model."""
+
+    def parse_file(self, filepath: str) -> list:
+        """Parse an ecore file and return a list of EPackages."""
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+
+        # Handle different root element forms
+        packages = []
+        tag = self._strip_ns(root.tag)
+
+        if tag == "EPackage":
+            pkg = self._parse_package(root, filepath)
+            packages.append(pkg)
+        elif tag == "XMI" or tag == "Resource":
+            for child in root:
+                ctag = self._strip_ns(child.tag)
+                if ctag == "EPackage":
+                    packages.append(self._parse_package(child, filepath))
+        else:
+            # Try treating root as package anyway
+            pkg = self._parse_package(root, filepath)
+            if pkg.name:
+                packages.append(pkg)
+
+        return packages
+
+    def _strip_ns(self, tag: str) -> str:
+        if "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def _parse_package(self, elem, filepath: str) -> EPackage:
+        pkg = EPackage(
+            name=elem.get("name", ""),
+            ns_uri=elem.get("nsURI", ""),
+            ns_prefix=elem.get("nsPrefix", ""),
+            source_file=filepath,
+        )
+
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            xsi_type = child.get(f"{{{XSI_NS}}}type", "")
+
+            if tag == "eClassifiers" or tag == "EClassifiers":
+                if "EClass" in xsi_type or xsi_type == "" and self._looks_like_class(child):
+                    cls = self._parse_class(child, pkg.name)
+                    pkg.classes.append(cls)
+                elif "EEnum" in xsi_type or self._looks_like_enum(child):
+                    enum = self._parse_enum(child, pkg.name)
+                    pkg.enums.append(enum)
+                elif "EDataType" in xsi_type or self._looks_like_datatype(child):
+                    dt = self._parse_datatype(child)
+                    pkg.data_types.append(dt)
+                else:
+                    # Guess based on content
+                    if self._has_literals(child):
+                        pkg.enums.append(self._parse_enum(child, pkg.name))
+                    elif self._has_structural_features(child):
+                        pkg.classes.append(self._parse_class(child, pkg.name))
+                    else:
+                        # Might be a data type or empty class
+                        instance_cn = child.get("instanceClassName") or child.get("instanceTypeName")
+                        if instance_cn:
+                            pkg.data_types.append(self._parse_datatype(child))
+                        else:
+                            pkg.classes.append(self._parse_class(child, pkg.name))
+            elif tag == "eSubpackages" or tag == "ESubpackages":
+                sub = self._parse_package(child, filepath)
+                pkg.sub_packages.append(sub)
+
+        return pkg
+
+    def _looks_like_class(self, elem) -> bool:
+        return self._has_structural_features(elem) or elem.get("eSuperTypes") is not None or elem.get("abstract") is not None
+
+    def _looks_like_enum(self, elem) -> bool:
+        return self._has_literals(elem)
+
+    def _looks_like_datatype(self, elem) -> bool:
+        return elem.get("instanceClassName") is not None or elem.get("instanceTypeName") is not None
+
+    def _has_literals(self, elem) -> bool:
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if "literal" in tag.lower() or "eLiterals" == tag:
+                return True
+        return False
+
+    def _has_structural_features(self, elem) -> bool:
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if "eStructuralFeatures" == tag or "feature" in tag.lower():
+                return True
+        return False
+
+    def _parse_class(self, elem, package_name: str) -> EClass:
+        cls = EClass(
+            name=elem.get("name", "UnknownClass"),
+            abstract=elem.get("abstract", "false").lower() == "true",
+            interface=elem.get("interface", "false").lower() == "true",
+            package_name=package_name,
+        )
+
+        # Parse super types
+        super_types_str = elem.get("eSuperTypes", "")
+        if super_types_str:
+            for st in super_types_str.split():
+                cls.super_types.append(st.strip())
+
+        # Parse structural features
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if tag == "eStructuralFeatures":
+                xsi_type = child.get(f"{{{XSI_NS}}}type", "")
+                if "EReference" in xsi_type:
+                    cls.references.append(self._parse_reference(child))
+                elif "EAttribute" in xsi_type:
+                    cls.attributes.append(self._parse_attribute(child))
+                else:
+                    # Guess: if it has eType referencing a class, it's a reference
+                    etype = child.get("eType", "")
+                    if etype and ("#//" in etype or "ecore:" in etype.lower()):
+                        if self._is_likely_reference(etype):
+                            cls.references.append(self._parse_reference(child))
+                        else:
+                            cls.attributes.append(self._parse_attribute(child))
+                    else:
+                        cls.attributes.append(self._parse_attribute(child))
+
+        return cls
+
+    def _is_likely_reference(self, etype: str) -> bool:
+        """Heuristic: if the type reference points to a class (not a built-in), it's a reference."""
+        type_name = self._extract_type_name(etype)
+        return type_name not in ECORE_TO_PROTO_TYPE
+
+    def _parse_attribute(self, elem) -> EAttribute:
+        etype_raw = elem.get("eType", "")
+        type_name = self._extract_type_name(etype_raw)
+
+        return EAttribute(
+            name=elem.get("name", "unknown"),
+            e_type=type_name,
+            lower_bound=int(elem.get("lowerBound", "0")),
+            upper_bound=int(elem.get("upperBound", "1")),
+            default_value=elem.get("defaultValueLiteral"),
+        )
+
+    def _parse_reference(self, elem) -> EReference:
+        etype_raw = elem.get("eType", "")
+        type_name = self._extract_type_name(etype_raw)
+
+        return EReference(
+            name=elem.get("name", "unknown"),
+            e_type=type_name,
+            containment=elem.get("containment", "false").lower() == "true",
+            lower_bound=int(elem.get("lowerBound", "0")),
+            upper_bound=int(elem.get("upperBound", "1")),
+            opposite=elem.get("eOpposite"),
+        )
+
+    def _parse_enum(self, elem, package_name: str) -> EEnum:
+        enum = EEnum(
+            name=elem.get("name", "UnknownEnum"),
+            package_name=package_name,
+        )
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if tag == "eLiterals":
+                literal = EEnumLiteral(
+                    name=child.get("name", "UNKNOWN"),
+                    value=int(child.get("value", "0")),
+                )
+                enum.literals.append(literal)
+        return enum
+
+    def _parse_datatype(self, elem) -> EDataType:
+        return EDataType(
+            name=elem.get("name", ""),
+            instance_class_name=elem.get("instanceClassName") or elem.get("instanceTypeName"),
+        )
+
+    def _extract_type_name(self, etype_raw: str) -> str:
+        """Extract a usable type name from eType attribute values like:
+        - '#//MyClass'
+        - 'ecore:EDataType http://www.eclipse.org/emf/2002/Ecore#//EString'
+        - 'othermodel.ecore#//SomeClass'
+        - '#//packageName/ClassName'
+        """
+        if not etype_raw:
+            return "EString"  # default
+
+        # Handle 'ecore:EDataType http://..../Ecore#//EString' form
+        if "#//" in etype_raw:
+            after_hash = etype_raw.split("#//")[-1]
+            # Could be 'EString' or 'package/ClassName'
+            return after_hash.split("/")[-1].strip()
+
+        # Plain type name
+        parts = etype_raw.split()
+        return parts[-1].strip()
+
+
+# ─── Cross-Reference Resolver ────────────────────────────────────────────────
+
+class ReferenceResolver:
+    """Resolves cross-references between packages from multiple ecore files."""
+
+    def __init__(self, packages: list):
+        self.packages = packages  # list[EPackage]
+        self.class_index = {}     # class_name -> package_name
+        self.enum_index = {}      # enum_name -> package_name
+        self.datatype_index = {}  # datatype_name -> instance_class_name
+        self._build_indices()
+
+    def _build_indices(self):
+        for pkg in self.packages:
+            self._index_package(pkg)
+
+    def _index_package(self, pkg: EPackage):
+        for cls in pkg.classes:
+            key = cls.name
+            self.class_index[key] = pkg.name
+            # Also index with package prefix for disambiguation
+            self.class_index[f"{pkg.name}.{cls.name}"] = pkg.name
+        for enum in pkg.enums:
+            self.enum_index[enum.name] = pkg.name
+            self.enum_index[f"{pkg.name}.{enum.name}"] = pkg.name
+        for dt in pkg.data_types:
+            if dt.instance_class_name:
+                self.datatype_index[dt.name] = dt.instance_class_name
+        for sub in pkg.sub_packages:
+            self._index_package(sub)
+
+    def resolve(self):
+        """Resolve all cross-references in all packages."""
+        for pkg in self.packages:
+            self._resolve_package(pkg)
+
+    def _resolve_package(self, pkg: EPackage):
+        for cls in pkg.classes:
+            # Resolve super types
+            for st in cls.super_types:
+                type_name = self._extract_type_from_uri(st)
+                target_pkg = self.class_index.get(type_name, pkg.name)
+                cls.resolved_supers.append((target_pkg, type_name))
+
+            # Resolve references
+            for ref in cls.references:
+                type_name = ref.e_type
+                if type_name in self.class_index:
+                    ref.resolved_package = self.class_index[type_name]
+                elif type_name in self.enum_index:
+                    ref.resolved_package = self.enum_index[type_name]
+                else:
+                    ref.resolved_package = pkg.name  # assume same package
+
+        for sub in pkg.sub_packages:
+            self._resolve_package(sub)
+
+    def _extract_type_from_uri(self, uri: str) -> str:
+        if "#//" in uri:
+            return uri.split("#//")[-1].split("/")[-1]
+        return uri.split("/")[-1]
+
+
+# ─── Proto Generator ─────────────────────────────────────────────────────────
+
+class ProtoGenerator:
+    """Generates .proto file content from parsed Ecore packages."""
+
+    def __init__(self, all_packages: list, resolver: ReferenceResolver,
+                 java_package_prefix: str = "", go_package_prefix: str = "",
+                 proto_package_prefix: str = ""):
+        self.all_packages = all_packages
+        self.resolver = resolver
+        self.java_package_prefix = java_package_prefix
+        self.go_package_prefix = go_package_prefix
+        self.proto_package_prefix = proto_package_prefix
+
+    def generate_all(self) -> dict:
+        """Generate proto content for all packages. Returns {filename: content}."""
+        result = OrderedDict()
+        for pkg in self.all_packages:
+            files = self._generate_package(pkg)
+            result.update(files)
+        return result
+
+    def _generate_package(self, pkg: EPackage) -> dict:
+        result = OrderedDict()
+        filename = self._package_to_filename(pkg.name)
+        content = self._generate_proto_file(pkg)
+        result[filename] = content
+
+        for sub in pkg.sub_packages:
+            sub_files = self._generate_package(sub)
+            result.update(sub_files)
+
+        return result
+
+    def _package_to_filename(self, name: str) -> str:
+        # Convert CamelCase to snake_case
+        s = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+        return f"{s}.proto"
+
+    def _generate_proto_file(self, pkg: EPackage) -> str:
+        lines = []
+        imports_needed = set()
+        proto_pkg_name = self._to_proto_package(pkg.name)
+
+        # Collect imports
+        for cls in pkg.classes:
+            cls_imports = self._collect_imports(cls, pkg)
+            imports_needed.update(cls_imports)
+
+        # Header
+        lines.append('syntax = "proto3";')
+        lines.append("")
+        lines.append(f"package {proto_pkg_name};")
+        lines.append("")
+
+        # Options
+        if self.java_package_prefix:
+            lines.append(f'option java_package = "{self.java_package_prefix}.{pkg.name}";')
+        if self.go_package_prefix:
+            go_pkg = f"{self.go_package_prefix}/{pkg.name.lower()}"
+            lines.append(f'option go_package = "{go_pkg}";')
+        if self.java_package_prefix or self.go_package_prefix:
+            lines.append("")
+
+        # Imports
+        sorted_imports = sorted(imports_needed)
+        if sorted_imports:
+            for imp in sorted_imports:
+                lines.append(f'import "{imp}";')
+            lines.append("")
+
+        # Enums (file-level)
+        for enum in pkg.enums:
+            lines.extend(self._generate_enum(enum, indent=0))
+            lines.append("")
+
+        # Messages
+        for cls in pkg.classes:
+            lines.extend(self._generate_message(cls, pkg))
+            lines.append("")
+
+        # Remove trailing blank lines
+        while lines and lines[-1] == "":
+            lines.pop()
+        lines.append("")  # single trailing newline
+
+        return "\n".join(lines)
+
+    def _collect_imports(self, cls: EClass, current_pkg: EPackage) -> set:
+        imports = set()
+
+        # Check attributes for well-known types
+        for attr in cls.attributes:
+            proto_type = self._resolve_attribute_type(attr, current_pkg)
+            if proto_type in WELL_KNOWN_TYPE_IMPORTS:
+                imports.add(WELL_KNOWN_TYPE_IMPORTS[proto_type])
+
+        # Check references for cross-package imports
+        for ref in cls.references:
+            if ref.resolved_package and ref.resolved_package != current_pkg.name:
+                imports.add(self._package_to_filename(ref.resolved_package))
+
+        # Check supers for cross-package imports
+        for (super_pkg, super_name) in cls.resolved_supers:
+            if super_pkg != current_pkg.name:
+                imports.add(self._package_to_filename(super_pkg))
+
+        return imports
+
+    def _generate_enum(self, enum: EEnum, indent: int = 0) -> list:
+        prefix = "  " * indent
+        lines = []
+        enum_name = self._to_proto_name(enum.name)
+        lines.append(f"{prefix}enum {enum_name} {{")
+
+        # Proto3 requires first enum value to be 0
+        has_zero = any(lit.value == 0 for lit in enum.literals)
+        if not has_zero:
+            unspecified_name = self._to_enum_value_name(enum.name, "UNSPECIFIED")
+            lines.append(f"{prefix}  {unspecified_name} = 0;")
+
+        for lit in enum.literals:
+            value_name = self._to_enum_value_name(enum.name, lit.name)
+            lines.append(f"{prefix}  {value_name} = {lit.value};")
+
+        lines.append(f"{prefix}}}")
+        return lines
+
+    def _generate_message(self, cls: EClass, current_pkg: EPackage) -> list:
+        lines = []
+        msg_name = self._to_proto_name(cls.name)
+
+        # Add comment for abstract classes
+        if cls.abstract:
+            lines.append(f"// Abstract base: {cls.name}")
+        if cls.interface:
+            lines.append(f"// Interface: {cls.name}")
+
+        lines.append(f"message {msg_name} {{")
+
+        field_number = 1
+
+        # Inheritance: include fields from super types as embedded messages
+        for (super_pkg, super_name) in cls.resolved_supers:
+            proto_super_name = self._to_proto_name(super_name)
+            if super_pkg != current_pkg.name:
+                proto_super_name = f"{self._to_proto_package(super_pkg)}.{proto_super_name}"
+            field_name = self._to_field_name(super_name)
+            lines.append(f"  // Inherited from {super_name}")
+            lines.append(f"  {proto_super_name} {field_name} = {field_number};")
+            field_number += 1
+
+        # Attributes
+        for attr in cls.attributes:
+            proto_type = self._resolve_attribute_type(attr, current_pkg)
+            field_name = self._to_field_name(attr.name)
+            repeated = "repeated " if attr.upper_bound == -1 else ""
+
+            comment = ""
+            if attr.default_value is not None:
+                comment = f"  // default: {attr.default_value}"
+
+            lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            field_number += 1
+
+        # References
+        for ref in cls.references:
+            proto_type = self._resolve_reference_type(ref, current_pkg)
+            field_name = self._to_field_name(ref.name)
+            repeated = "repeated " if ref.upper_bound == -1 else ""
+
+            comment_parts = []
+            if ref.containment:
+                comment_parts.append("containment")
+            if ref.opposite:
+                comment_parts.append(f"opposite: {ref.opposite}")
+            comment = f"  // {', '.join(comment_parts)}" if comment_parts else ""
+
+            lines.append(f"  {repeated}{proto_type} {field_name} = {field_number};{comment}")
+            field_number += 1
+
+        lines.append("}")
+        return lines
+
+    def _resolve_attribute_type(self, attr: EAttribute, current_pkg: EPackage) -> str:
+        type_name = attr.e_type
+
+        # Direct mapping
+        if type_name in ECORE_TO_PROTO_TYPE:
+            return ECORE_TO_PROTO_TYPE[type_name]
+
+        # Check if it's a custom data type in the current package
+        for dt in current_pkg.data_types:
+            if dt.name == type_name and dt.instance_class_name:
+                if dt.instance_class_name in ECORE_TO_PROTO_TYPE:
+                    return ECORE_TO_PROTO_TYPE[dt.instance_class_name]
+
+        # Check if it's an enum in the current package
+        for enum in current_pkg.enums:
+            if enum.name == type_name:
+                return self._to_proto_name(type_name)
+
+        # Check global enum index
+        if type_name in self.resolver.enum_index:
+            enum_pkg = self.resolver.enum_index[type_name]
+            if enum_pkg == current_pkg.name:
+                return self._to_proto_name(type_name)
+            else:
+                return f"{self._to_proto_package(enum_pkg)}.{self._to_proto_name(type_name)}"
+
+        # Check global datatype index
+        if type_name in self.resolver.datatype_index:
+            java_type = self.resolver.datatype_index[type_name]
+            if java_type in ECORE_TO_PROTO_TYPE:
+                return ECORE_TO_PROTO_TYPE[java_type]
+
+        # Fallback
+        return "string"
+
+    def _resolve_reference_type(self, ref: EReference, current_pkg: EPackage) -> str:
+        type_name = ref.e_type
+
+        # Check if it's in the same package
+        for cls in current_pkg.classes:
+            if cls.name == type_name:
+                return self._to_proto_name(type_name)
+
+        # Check cross-package
+        if ref.resolved_package and ref.resolved_package != current_pkg.name:
+            return f"{self._to_proto_package(ref.resolved_package)}.{self._to_proto_name(type_name)}"
+
+        return self._to_proto_name(type_name)
+
+    # ── Naming Helpers ────────────────────────────────────────────────────
+
+    def _to_proto_package(self, name: str) -> str:
+        """Convert package name to proto package style."""
+        pkg = name.lower().replace("-", "_").replace(".", "_")
+        if self.proto_package_prefix:
+            return f"{self.proto_package_prefix}.{pkg}"
+        return pkg
+
+    def _to_proto_name(self, name: str) -> str:
+        """Ensure PascalCase for message/enum names."""
+        if not name:
+            return "Unknown"
+        return name[0].upper() + name[1:]
+
+    def _to_field_name(self, name: str) -> str:
+        """Convert to snake_case for proto field names."""
+        # Insert underscore before uppercase letters
+        s = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+        # Clean up
+        s = re.sub(r'[^a-z0-9_]', '_', s)
+        s = re.sub(r'_+', '_', s).strip('_')
+        # Ensure it doesn't start with a digit
+        if s and s[0].isdigit():
+            s = f"field_{s}"
+        return s or "unknown"
+
+    def _to_enum_value_name(self, enum_name: str, literal_name: str) -> str:
+        """Convert to UPPER_SNAKE_CASE with enum prefix."""
+        prefix = self._camel_to_upper_snake(enum_name)
+        value = self._camel_to_upper_snake(literal_name)
+        # Avoid double-prefix if literal already starts with enum name
+        if value.startswith(prefix):
+            return value
+        return f"{prefix}_{value}"
+
+    @staticmethod
+    def _camel_to_upper_snake(name: str) -> str:
+        """Convert CamelCase or ALLCAPS to UPPER_SNAKE_CASE properly."""
+        # If already UPPER_SNAKE_CASE, just clean it
+        if name == name.upper():
+            return re.sub(r'[^A-Z0-9_]', '_', name).strip('_')
+        # Insert underscore between: lowercase->uppercase, uppercase->uppercase+lowercase
+        s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+        s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+        s = re.sub(r'[^A-Za-z0-9_]', '_', s)
+        return s.upper().strip('_')
+
+
+# ─── Flatten Subpackages ─────────────────────────────────────────────────────
+
+def flatten_packages(packages: list) -> list:
+    """Recursively flatten sub-packages into a flat list."""
+    result = []
+    for pkg in packages:
+        result.append(pkg)
+        if pkg.sub_packages:
+            result.extend(flatten_packages(pkg.sub_packages))
+    return result
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def find_ecore_files(paths: list) -> list:
+    """Given a list of file/directory paths, find all .ecore files."""
+    files = []
+    for p in paths:
+        path = Path(p)
+        if path.is_file() and path.suffix == ".ecore":
+            files.append(str(path))
+        elif path.is_dir():
+            for f in sorted(path.rglob("*.ecore")):
+                files.append(str(f))
+        else:
+            print(f"Warning: skipping '{p}' (not a .ecore file or directory)", file=sys.stderr)
+    return files
+
+
+def convert(ecore_files: list, output_dir: str = ".",
+            java_package: str = "", go_package: str = "",
+            proto_package: str = "", verbose: bool = False) -> dict:
+    """
+    Convert a list of ecore files to proto files.
+
+    Returns a dict of {filename: proto_content}.
+    """
+    parser = EcoreParser()
+    all_packages = []
+
+    for filepath in ecore_files:
+        if verbose:
+            print(f"Parsing: {filepath}", file=sys.stderr)
+        try:
+            packages = parser.parse_file(filepath)
+            all_packages.extend(packages)
+        except ET.ParseError as e:
+            print(f"Error parsing {filepath}: {e}", file=sys.stderr)
+            continue
+
+    if not all_packages:
+        print("No packages found in the provided ecore files.", file=sys.stderr)
+        return {}
+
+    # Flatten sub-packages
+    flat_packages = flatten_packages(all_packages)
+
+    if verbose:
+        print(f"\nFound {len(flat_packages)} package(s):", file=sys.stderr)
+        for pkg in flat_packages:
+            print(f"  - {pkg.name}: {len(pkg.classes)} classes, "
+                  f"{len(pkg.enums)} enums, {len(pkg.data_types)} data types",
+                  file=sys.stderr)
+
+    # Resolve cross-references
+    resolver = ReferenceResolver(flat_packages)
+    resolver.resolve()
+
+    # Generate proto files
+    generator = ProtoGenerator(
+        flat_packages, resolver,
+        java_package_prefix=java_package,
+        go_package_prefix=go_package,
+        proto_package_prefix=proto_package,
+    )
+    proto_files = generator.generate_all()
+
+    # Write output
+    os.makedirs(output_dir, exist_ok=True)
+    for filename, content in proto_files.items():
+        outpath = os.path.join(output_dir, filename)
+        with open(outpath, "w") as f:
+            f.write(content)
+        if verbose:
+            print(f"Generated: {outpath}", file=sys.stderr)
+
+    return proto_files
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Eclipse Ecore (.ecore) files to Protocol Buffer (.proto) files.",
+        epilog="Examples:\n"
+               "  %(prog)s model.ecore\n"
+               "  %(prog)s models/ -o proto_out/ -v\n"
+               "  %(prog)s base.ecore domain.ecore -o output/ --java-package com.example\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("inputs", nargs="+",
+                        help="Ecore files or directories containing ecore files")
+    parser.add_argument("-o", "--output-dir", default=".",
+                        help="Output directory for .proto files (default: current dir)")
+    parser.add_argument("--java-package", default="",
+                        help="Java package prefix for generated protos")
+    parser.add_argument("--go-package", default="",
+                        help="Go package prefix for generated protos")
+    parser.add_argument("--proto-package", default="",
+                        help="Proto package prefix")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print verbose output")
+
+    args = parser.parse_args()
+
+    ecore_files = find_ecore_files(args.inputs)
+    if not ecore_files:
+        print("No .ecore files found.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.verbose:
+        print(f"Found {len(ecore_files)} ecore file(s):", file=sys.stderr)
+        for f in ecore_files:
+            print(f"  {f}", file=sys.stderr)
+
+    proto_files = convert(
+        ecore_files,
+        output_dir=args.output_dir,
+        java_package=args.java_package,
+        go_package=args.go_package,
+        proto_package=args.proto_package,
+        verbose=args.verbose,
+    )
+
+    if proto_files:
+        print(f"\nSuccessfully generated {len(proto_files)} proto file(s) in '{args.output_dir}':")
+        for fname in proto_files:
+            print(f"  {fname}")
+    else:
+        print("No proto files were generated.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

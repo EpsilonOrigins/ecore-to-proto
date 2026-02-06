@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package domain;
+
+import "base.proto";
+
+enum Priority {
+  PRIORITY_LOW = 0;
+  PRIORITY_MEDIUM = 1;
+  PRIORITY_HIGH = 2;
+  PRIORITY_CRITICAL = 3;
+}
+
+message Organization {
+  // Inherited from NamedElement
+  base.NamedElement named_element = 1;
+  string website = 2;
+  int32 employee_count = 3;
+  repeated Department departments = 4;  // containment
+  base.AuditInfo audit_info = 5;  // containment
+}
+
+message Department {
+  // Inherited from NamedElement
+  base.NamedElement named_element = 1;
+  Employee manager = 2;
+  repeated Employee employees = 3;  // containment
+  Organization organization = 4;  // opposite: #//Organization/departments
+}
+
+message Employee {
+  // Inherited from NamedElement
+  base.NamedElement named_element = 1;
+  string email = 2;
+  double salary = 3;
+  bool is_active = 4;  // default: true
+  repeated string tags = 5;
+  Department department = 6;
+}
+
+message Project {
+  // Inherited from NamedElement
+  base.NamedElement named_element = 1;
+  Priority priority = 2;  // default: MEDIUM
+  double budget = 3;
+  repeated Employee members = 4;
+  Employee lead = 5;
+  repeated Project sub_projects = 6;  // containment
+}

@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package base;
+
+import "google/protobuf/timestamp.proto";
+
+enum Status {
+  STATUS_ACTIVE = 0;
+  STATUS_INACTIVE = 1;
+  STATUS_PENDING = 2;
+}
+
+// Abstract base: NamedElement
+message NamedElement {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  Status status = 4;  // default: ACTIVE
+}
+
+message AuditInfo {
+  string created_by = 1;
+  google.protobuf.Timestamp created_at = 2;
+  string modified_by = 3;
+  google.protobuf.Timestamp modified_at = 4;
+}
