@@ -170,6 +170,36 @@ WELL_KNOWN_TYPE_IMPORTS = {
 class EcoreParser:
     """Parses .ecore (XMI/XML) files into our data model."""
 
+    # Characters that XML decodes from entities like &#xA; &#xD; &#x9;
+    # plus other common whitespace noise found in ecore files.
+    _WS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+')  # control chars
+    _COLLAPSE_RE = re.compile(r'[ \t\n\r]+')  # runs of whitespace
+
+    @staticmethod
+    def _sanitize(value: Optional[str]) -> Optional[str]:
+        """Clean a string value from XML attributes.
+
+        - Strips control characters (NUL, BEL, etc.)
+        - Replaces newlines, tabs, carriage returns with spaces
+        - Collapses multiple whitespace into single space
+        - Strips leading/trailing whitespace
+
+        Returns None if input is None (preserves optional semantics).
+        """
+        if value is None:
+            return None
+        # Remove control characters (keep normal whitespace for now)
+        s = EcoreParser._WS_RE.sub('', value)
+        # Collapse all whitespace (newlines, tabs, multiple spaces) to single space
+        s = EcoreParser._COLLAPSE_RE.sub(' ', s)
+        return s.strip()
+
+    @staticmethod
+    def _sanitize_name(value: str) -> str:
+        """Clean an identifier/name — also removes any remaining spaces."""
+        s = EcoreParser._sanitize(value) or ""
+        return s.replace(" ", "")
+
     def parse_file(self, filepath: str) -> list:
         """Parse an ecore file and return a list of EPackages."""
         tree = ET.parse(filepath)
@@ -202,9 +232,9 @@ class EcoreParser:
 
     def _parse_package(self, elem, filepath: str) -> EPackage:
         pkg = EPackage(
-            name=elem.get("name", ""),
-            ns_uri=elem.get("nsURI", ""),
-            ns_prefix=elem.get("nsPrefix", ""),
+            name=self._sanitize_name(elem.get("name", "")),
+            ns_uri=self._sanitize(elem.get("nsURI", "")) or "",
+            ns_prefix=self._sanitize_name(elem.get("nsPrefix", "")),
             source_file=filepath,
             annotations=self._parse_annotations(elem),
         )
@@ -267,7 +297,7 @@ class EcoreParser:
 
     def _parse_class(self, elem, package_name: str) -> EClass:
         cls = EClass(
-            name=elem.get("name", "UnknownClass"),
+            name=self._sanitize_name(elem.get("name", "UnknownClass")),
             abstract=elem.get("abstract", "false").lower() == "true",
             interface=elem.get("interface", "false").lower() == "true",
             package_name=package_name,
@@ -312,11 +342,11 @@ class EcoreParser:
         type_name, source_hint = self._extract_type_info(etype_raw)
 
         return EAttribute(
-            name=elem.get("name", "unknown"),
+            name=self._sanitize_name(elem.get("name", "unknown")),
             e_type=type_name,
             lower_bound=int(elem.get("lowerBound", "0")),
             upper_bound=int(elem.get("upperBound", "1")),
-            default_value=elem.get("defaultValueLiteral"),
+            default_value=self._sanitize(elem.get("defaultValueLiteral")),
             source_hint=source_hint,
             annotations=self._parse_annotations(elem),
         )
@@ -326,12 +356,12 @@ class EcoreParser:
         type_name, source_hint = self._extract_type_info(etype_raw)
 
         return EReference(
-            name=elem.get("name", "unknown"),
+            name=self._sanitize_name(elem.get("name", "unknown")),
             e_type=type_name,
             containment=elem.get("containment", "false").lower() == "true",
             lower_bound=int(elem.get("lowerBound", "0")),
             upper_bound=int(elem.get("upperBound", "1")),
-            opposite=elem.get("eOpposite"),
+            opposite=self._sanitize(elem.get("eOpposite")),
             source_hint=source_hint,
             annotations=self._parse_annotations(elem),
         )
@@ -353,13 +383,13 @@ class EcoreParser:
         for child in elem:
             tag = self._strip_ns(child.tag)
             if tag == "eAnnotations":
-                source = child.get("source", "")
+                source = self._sanitize(child.get("source", "")) or ""
                 details = {}
                 for detail in child:
                     dtag = self._strip_ns(detail.tag)
                     if dtag == "details":
-                        key = detail.get("key", "")
-                        value = detail.get("value", "")
+                        key = self._sanitize(detail.get("key", "")) or ""
+                        value = self._sanitize(detail.get("value", "")) or ""
                         if key:
                             details[key] = value
                 if details:
@@ -368,7 +398,7 @@ class EcoreParser:
 
     def _parse_enum(self, elem, package_name: str) -> EEnum:
         enum = EEnum(
-            name=elem.get("name", "UnknownEnum"),
+            name=self._sanitize_name(elem.get("name", "UnknownEnum")),
             package_name=package_name,
             annotations=self._parse_annotations(elem),
         )
@@ -376,7 +406,7 @@ class EcoreParser:
             tag = self._strip_ns(child.tag)
             if tag == "eLiterals":
                 literal = EEnumLiteral(
-                    name=child.get("name", "UNKNOWN"),
+                    name=self._sanitize_name(child.get("name", "UNKNOWN")),
                     value=int(child.get("value", "0")),
                 )
                 enum.literals.append(literal)
@@ -384,8 +414,10 @@ class EcoreParser:
 
     def _parse_datatype(self, elem) -> EDataType:
         return EDataType(
-            name=elem.get("name", ""),
-            instance_class_name=elem.get("instanceClassName") or elem.get("instanceTypeName"),
+            name=self._sanitize_name(elem.get("name", "")),
+            instance_class_name=self._sanitize(
+                elem.get("instanceClassName") or elem.get("instanceTypeName")
+            ),
         )
 
     def _extract_type_info(self, etype_raw: str) -> tuple:
@@ -709,11 +741,20 @@ class AnnotationCollector:
             self._value_samples[lookup].add(value)
 
     def _finalize(self):
-        """Finalize inferred types and assign field names, prefixing only on collision."""
+        """Finalize inferred types and assign field names, prefixing only on collision.
+
+        Deduplicates by final field_name — if two (source, key) pairs resolve to the
+        same snake_case name, only the first is kept as an extension field and the
+        second reuses it.
+        """
         # Detect which raw keys appear under multiple sources
         key_to_sources: dict[str, set] = {}
         for (source_short, key) in self.options:
             key_to_sources.setdefault(key, set()).add(source_short)
+
+        # Assign field names and deduplicate
+        seen_field_names: dict[str, AnnotationOptionDef] = {}  # field_name -> first opt
+        duplicates = []  # lookups to redirect
 
         for lookup, opt in self.options.items():
             source_short, key = lookup
@@ -721,9 +762,20 @@ class AnnotationCollector:
             opt.proto_type = _infer_proto_type(self._value_samples.get(lookup, set()))
             # Only prefix with source when the same key exists under multiple sources
             needs_prefix = len(key_to_sources.get(key, set())) > 1
-            opt.field_name = self._to_option_field_name(
+            candidate_name = self._to_option_field_name(
                 source_short if needs_prefix else "", key
             )
+
+            if candidate_name in seen_field_names:
+                # This field name already exists — redirect to the existing def
+                duplicates.append((lookup, seen_field_names[candidate_name]))
+            else:
+                opt.field_name = candidate_name
+                seen_field_names[candidate_name] = opt
+
+        # Point duplicate lookups to the existing option def
+        for lookup, existing_opt in duplicates:
+            self.options[lookup] = existing_opt
 
     @staticmethod
     def _to_option_field_name(source_short: str, key: str) -> str:
@@ -743,6 +795,10 @@ class AnnotationCollector:
 
     def has_annotations(self) -> bool:
         return len(self.options) > 0
+
+    def unique_option_count(self) -> int:
+        """Count of deduplicated option fields (by field_name)."""
+        return len({opt.field_name for opt in self.options.values()})
 
     def get_option_for(self, ann: EAnnotation, key: str) -> Optional[AnnotationOptionDef]:
         """Look up the option definition for a given annotation detail key."""
@@ -764,9 +820,13 @@ class AnnotationCollector:
         lines.append('import "google/protobuf/descriptor.proto";')
         lines.append("")
 
-        # Group options by source for readability
+        # Group options by source for readability, skipping duplicates
         by_source: OrderedDict[str, list] = OrderedDict()
+        emitted_field_names: set = set()
         for (source_short, _), opt in self.options.items():
+            if opt.field_name in emitted_field_names:
+                continue
+            emitted_field_names.add(opt.field_name)
             by_source.setdefault(source_short, []).append(opt)
 
         lines.append("extend google.protobuf.FieldOptions {")
@@ -1253,10 +1313,19 @@ def convert(ecore_files: list, output_dir: str = ".",
     annotation_collector.scan_packages(flat_packages)
 
     if verbose and annotation_collector.has_annotations():
-        print(f"\nFound {len(annotation_collector.options)} unique annotation option(s):",
-              file=sys.stderr)
+        unique = annotation_collector.unique_option_count()
+        total = len(annotation_collector.options)
+        dupes = total - unique
+        label = f"{unique} unique annotation option(s)"
+        if dupes:
+            label += f" ({dupes} duplicate(s) merged)"
+        print(f"\n{label}:", file=sys.stderr)
+        seen = set()
         for (src, key), opt in annotation_collector.options.items():
-            print(f"  - [{src}] {key} → {opt.proto_type} (field #{opt.field_number})",
+            if opt.field_name in seen:
+                continue
+            seen.add(opt.field_name)
+            print(f"  - {opt.field_name}: {opt.proto_type} (field #{opt.field_number})",
                   file=sys.stderr)
 
     # Generate proto files
